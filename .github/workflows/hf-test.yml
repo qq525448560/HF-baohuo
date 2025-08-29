@@ -1,0 +1,76 @@
+name: HF Spaces Test
+
+on:
+  workflow_dispatch: # 手动触发
+
+jobs:
+  test-hf-spaces:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Test ping HuggingFace Spaces
+        run: |
+          set -uo pipefail
+
+          HF_SPACES_RAW="${{ secrets.HF_SPACES_RAW }}"
+          HF_TOKENS_RAW="${{ secrets.HF_TOKENS_RAW }}"
+
+          if [ -z "${HF_SPACES_RAW:-}" ]; then
+            echo "::error::HF_SPACES_RAW secret is not set or empty"
+            exit 1
+          fi
+          if [ -z "${HF_TOKENS_RAW:-}" ]; then
+            echo "::error::HF_TOKENS_RAW secret is not set or empty"
+            exit 1
+          fi
+
+          # helper: split comma list into bash array
+          split_to_array() {
+            raw="$1"
+            mapfile -t arr < <(printf "%s" "$raw" | tr ',' '\n' | sed 's/\r//g' | sed '/^[[:space:]]*$/d')
+            for i in "${!arr[@]}"; do
+              arr[$i]="$(echo "${arr[$i]}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            done
+            printf '%s\0' "${arr[@]}"
+          }
+
+          IFS= read -r -d '' -a SPACES < <(split_to_array "$HF_SPACES_RAW") || true
+          IFS= read -r -d '' -a TOKENS < <(split_to_array "$HF_TOKENS_RAW") || true
+
+          if [ ${#SPACES[@]} -ne ${#TOKENS[@]} ]; then
+            echo "::error::HF_SPACES and HF_TOKENS count mismatch"
+            echo "Spaces: ${#SPACES[@]}, Tokens: ${#TOKENS[@]}"
+            exit 1
+          fi
+
+          echo "Found ${#SPACES[@]} spaces to test."
+
+          for idx in "${!SPACES[@]}"; do
+            space="${SPACES[$idx]}"
+            token="${TOKENS[$idx]}"
+
+            echo "=============================="
+            echo "Testing Space [$((idx+1))/${#SPACES[@]}]: $space"
+            test_url="https://${space}-${token}.hf.space/"
+            echo "URL: $test_url"
+
+            http_code=$(curl -sSL -w "%{http_code}" -o response.txt --max-time 30 "$test_url" || echo "000")
+            echo "HTTP status: $http_code"
+
+            echo "---- First 20 lines of response ----"
+            head -n 20 response.txt || true
+            echo "------------------------------------"
+
+            # 简单判定
+            if grep -qi "gradio-app" response.txt; then
+              echo "✅ 检测到 Gradio 页面元素，说明 Space 在运行"
+            elif grep -qi "Space is currently sleeping" response.txt; then
+              echo "⚠️ 检测到休眠提示页面"
+            else
+              echo "❓ 返回页面不明确，需人工确认"
+            fi
+
+            echo "=============================="
+          done
