@@ -1,76 +1,172 @@
-name: HF Spaces Test
+name: Keep Hugging Face Space Awake
 
 on:
-  workflow_dispatch: # 手动触发
+  schedule:
+    - cron: "0 * * * *" # 每小时执行一次
+  workflow_dispatch:
 
 jobs:
-  test-hf-spaces:
+  keepalive:
     runs-on: ubuntu-latest
+    env:
+      # 从 Secrets 读取，格式说明见下面注释
+      HF_SPACE: ${{ secrets.HF_SPACE }}   # 例如: mm77777/7, asdjas2/asjhgd
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}   # 例如: hf-AAA...,hf-BBB...
+      MAX_ATTEMPTS: 3
+      BASE_SLEEP: 5
+      BATCH_SIZE: 5   # 分批次大小（每批处理 BATCH_SIZE 个 URL，默认 5）
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Test ping HuggingFace Spaces
+      - name: Ping multiple HF Spaces (batch)
+        shell: bash
         run: |
-          set -uo pipefail
+          set -euo pipefail
 
-          HF_SPACES_RAW="${{ secrets.HF_SPACES_RAW }}"
-          HF_TOKENS_RAW="${{ secrets.HF_TOKENS_RAW }}"
-
-          if [ -z "${HF_SPACES_RAW:-}" ]; then
-            echo "::error::HF_SPACES_RAW secret is not set or empty"
-            exit 1
-          fi
-          if [ -z "${HF_TOKENS_RAW:-}" ]; then
-            echo "::error::HF_TOKENS_RAW secret is not set or empty"
-            exit 1
-          fi
-
-          # helper: split comma list into bash array
-          split_to_array() {
-            raw="$1"
-            mapfile -t arr < <(printf "%s" "$raw" | tr ',' '\n' | sed 's/\r//g' | sed '/^[[:space:]]*$/d')
-            for i in "${!arr[@]}"; do
-              arr[$i]="$(echo "${arr[$i]}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-            done
-            printf '%s\0' "${arr[@]}"
+          # Helper: trim whitespace
+          trim() {
+            echo "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
           }
 
-          IFS= read -r -d '' -a SPACES < <(split_to_array "$HF_SPACES_RAW") || true
-          IFS= read -r -d '' -a TOKENS < <(split_to_array "$HF_TOKENS_RAW") || true
-
-          if [ ${#SPACES[@]} -ne ${#TOKENS[@]} ]; then
-            echo "::error::HF_SPACES and HF_TOKENS count mismatch"
-            echo "Spaces: ${#SPACES[@]}, Tokens: ${#TOKENS[@]}"
+          # Read and split HF_SPACE and HF_TOKEN (comma-separated)
+          if [ -z "${HF_SPACE:-}" ]; then
+            echo "::error::HF_SPACE is empty. Set repository secret HF_SPACE (comma-separated owner/repo entries)."
             exit 1
           fi
 
-          echo "Found ${#SPACES[@]} spaces to test."
+          SPACES_RAW="$HF_SPACE"
+          TOKENS_RAW="${HF_TOKEN:-}"
 
-          for idx in "${!SPACES[@]}"; do
-            space="${SPACES[$idx]}"
-            token="${TOKENS[$idx]}"
+          IFS=',' read -ra RAW_SPACES <<< "$SPACES_RAW"
+          IFS=',' read -ra RAW_TOKENS <<< "$TOKENS_RAW"
 
-            echo "=============================="
-            echo "Testing Space [$((idx+1))/${#SPACES[@]}]: $space"
-            test_url="https://${space}-${token}.hf.space/"
-            echo "URL: $test_url"
+          # Build arrays: cleaned spaces -> urls, cleaned tokens
+          URLS=()
+          for s in "${RAW_SPACES[@]}"; do
+            s_trim=$(trim "$s")
+            # skip empty
+            if [ -z "$s_trim" ]; then
+              continue
+            fi
+            # Replace slashes with hyphens to form "<owner>-<repo>"
+            # (replace all '/' with '-')
+            slug=$(echo "$s_trim" | sed 's#/#-#g')
+            url="https://${slug}.hf.space/"
+            URLS+=("$url")
+          done
 
-            http_code=$(curl -sSL -w "%{http_code}" -o response.txt --max-time 30 "$test_url" || echo "000")
-            echo "HTTP status: $http_code"
+          TOKENS=()
+          for t in "${RAW_TOKENS[@]}"; do
+            t_trim=$(trim "$t")
+            if [ -n "$t_trim" ]; then
+              TOKENS+=("$t_trim")
+            fi
+          done
 
-            echo "---- First 20 lines of response ----"
-            head -n 20 response.txt || true
-            echo "------------------------------------"
+          if [ "${#URLS[@]}" -eq 0 ]; then
+            echo "::error::No valid HF_SPACE entries found after parsing."
+            exit 1
+          fi
 
-            # 简单判定
-            if grep -qi "gradio-app" response.txt; then
-              echo "✅ 检测到 Gradio 页面元素，说明 Space 在运行"
-            elif grep -qi "Space is currently sleeping" response.txt; then
-              echo "⚠️ 检测到休眠提示页面"
-            else
-              echo "❓ 返回页面不明确，需人工确认"
+          echo "Detected ${#URLS[@]} URL(s) to ping."
+          echo "Using ${#TOKENS[@]} token(s)."
+          # Don't echo actual tokens for security; show partial masks
+          if [ "${#TOKENS[@]}" -gt 0 ]; then
+            for idx in "${!TOKENS[@]}"; do
+              t="${TOKENS[$idx]}"
+              echo "  token $((idx+1)): ${t:0:6}... (masked)"
+            done
+          else
+            echo "  No HF_TOKEN provided; requests will be made without Authorization header."
+          fi
+
+          # ping function: try all tokens each attempt; return 0 on success, 1 on failure
+          ping_url() {
+            local url="$1"
+            local max_attempts="$2"
+            local base_sleep="$3"
+            echo "-> Pinging $url"
+
+            attempt=1
+            while [ $attempt -le "$max_attempts" ]; do
+              echo "  Attempt $attempt/$max_attempts for $url"
+
+              # If tokens exist, try each token. Otherwise try unauthenticated once per attempt.
+              if [ "${#TOKENS[@]}" -gt 0 ]; then
+                for t in "${TOKENS[@]}"; do
+                  # do not print full token
+                  echo -n "    Trying token prefix: ${t:0:6}... "
+                  status=$(curl -sSL -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $t" "$url" || echo "000")
+                  echo "HTTP $status"
+                  if [ "$status" = "200" ] || [ "$status" = "302" ]; then
+                    echo "    ✅ $url reachable with token prefix ${t:0:6} (HTTP $status)"
+                    return 0
+                  fi
+                done
+              else
+                # no token: try unauthenticated
+                status=$(curl -sSL -o /dev/null -w "%{http_code}" "$url" || echo "000")
+                echo "    HTTP $status (no token)"
+                if [ "$status" = "200" ] || [ "$status" = "302" ]; then
+                  echo "    ✅ $url reachable (no token) HTTP $status"
+                  return 0
+                fi
+              fi
+
+              # if not last attempt, sleep backoff
+              if [ $attempt -lt "$max_attempts" ]; then
+                sleep_seconds=$(( base_sleep * attempt ))
+                echo "    Waiting $sleep_seconds seconds before next attempt..."
+                sleep $sleep_seconds
+              fi
+
+              attempt=$((attempt + 1))
+            done
+
+            echo "    ❌ All attempts failed for $url (last HTTP $status)"
+            return 1
+          }
+
+          # Process URLs in batches of BATCH_SIZE (each batch processed sequentially)
+          BATCH_SIZE="${BATCH_SIZE:-5}"
+          MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
+          BASE_SLEEP="${BASE_SLEEP:-5}"
+
+          failed_urls=()
+
+          total=${#URLS[@]}
+          i=0
+          while [ $i -lt $total ]; do
+            end=$(( i + BATCH_SIZE ))
+            if [ $end -gt $total ]; then end=$total; fi
+            echo "Processing batch: indexes [$i .. $((end-1))]"
+
+            for (( j=i; j<end; j++ )); do
+              url="${URLS[$j]}"
+              if ping_url "$url" "$MAX_ATTEMPTS" "$BASE_SLEEP"; then
+                echo "Completed: $url"
+              else
+                failed_urls+=("$url")
+              fi
+            done
+
+            # small pause between batches to avoid hammering
+            if [ $end -lt $total ]; then
+              echo "Sleeping 2 seconds before next batch..."
+              sleep 2
             fi
 
-            echo "=============================="
+            i=$end
           done
+
+          if [ "${#failed_urls[@]}" -ne 0 ]; then
+            echo "::error::The following URLs failed after all attempts:"
+            for u in "${failed_urls[@]}"; do
+              echo "  - $u"
+            done
+            exit 1
+          fi
+
+          echo "All URLs reachable."
+        env:
+          # expose the secret values to the script (they were put in job env)
+          HF_SPACE: ${{ secrets.HF_SPACE }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
