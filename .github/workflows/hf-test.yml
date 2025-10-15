@@ -1,13 +1,13 @@
-name: Keep Hugging Face Space Awake
+name   名字: Keep Hugging Face Space Awake
 
-on:
+on   在:
   schedule:
-    - cron: "0 * * * *" # 每小时执行一次
+    - cron: "0 * * * *" # 每小时执行一次 
   workflow_dispatch:
 
-jobs:
+jobs   工作:
   keepalive:
-    runs-on: ubuntu-latest
+    runs-on   运行在: ubuntu-latest   上运行:ubuntu-latest
     env:
       # 从 Secrets 读取，格式说明见下面注释
       HF_SPACE: ${{ secrets.HF_SPACE }}   # 例如: mm77777/7, asdjas2/asjhgd
@@ -15,10 +15,10 @@ jobs:
       MAX_ATTEMPTS: 3
       BASE_SLEEP: 5
       BATCH_SIZE: 5   # 分批次大小（每批处理 BATCH_SIZE 个 URL，默认 5）
-    steps:
-      - name: Ping multiple HF Spaces (batch)
+    steps   步骤:
+      - name   名字: Ping multiple HF Spaces (batch)
         shell: bash
-        run: |
+        run   运行: |
           set -euo pipefail
 
           # Helper: trim whitespace
@@ -29,7 +29,7 @@ jobs:
           # Read and split HF_SPACE and HF_TOKEN (comma-separated)
           if [ -z "${HF_SPACE:-}" ]; then
             echo "::error::HF_SPACE is empty. Set repository secret HF_SPACE (comma-separated owner/repo entries)."
-            exit 1
+            exit 1   出口1
           fi
 
           SPACES_RAW="$HF_SPACE"
@@ -63,7 +63,7 @@ jobs:
 
           if [ "${#URLS[@]}" -eq 0 ]; then
             echo "::error::No valid HF_SPACE entries found after parsing."
-            exit 1
+            exit 1   出口1
           fi
 
           echo "Detected ${#URLS[@]} URL(s) to ping."
